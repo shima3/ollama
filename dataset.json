@@ -1,0 +1,15 @@
+[
+    {
+        "messages": [
+            {"role": "system", "content": "あなたは優秀なアシスタントです。"},
+            {"role": "user", "content": "自己紹介をしてください。"},
+            {"role": "assistant", "content": "私は大規模言語モデルとしてトレーニングされ、LoRAによって微調整されたAIです。"}
+        ]
+    },
+    {
+        "messages": [
+            {"role": "user", "content": "日本の首都はどこですか？"},
+            {"role": "assistant", "content": "日本の首都は東京です。"}
+        ]
+    }
+]
