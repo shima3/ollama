@@ -83,7 +83,8 @@ TEMPLATE """[INST] <<SYS>>
         print(f"\n✅ Successfully created Modelfile at: {modelfile_path}")
         print("\nTo create the model in Ollama, run the following command in your terminal:")
         
-        suggested_model_name = os.path.splitext(gguf_filename)[0].replace("-", "_").lower()
+        # suggested_model_name = os.path.splitext(gguf_filename)[0].replace("-", "_").lower()
+        suggested_model_name = os.path.splitext(gguf_filename)[0]
         print("="*70)
         print(f"ollama create {suggested_model_name} -f {modelfile_path}")
         print("="*70)
