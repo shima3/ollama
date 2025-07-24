@@ -46,6 +46,51 @@ def find_targetable_modules(model_name: str):
         if 'model' in locals(): del model
         torch.cuda.empty_cache()
 
+def create_modelfile(base_model_name: str, gguf_path: str):
+    """
+    指定されたGGUFファイル用のModelfileを自動生成する。
+    """
+    gguf_filename = os.path.basename(gguf_path)
+    modelfile_path = os.path.join(os.path.dirname(gguf_path) or ".", "Modelfile")
+
+    template = ""
+    parameters = []
+
+    model_name_lower = base_model_name.lower()
+    if "llama-2" in model_name_lower and "instruct" in model_name_lower:
+        print("Detected Llama-2-Instruct style model. Generating appropriate Modelfile.")
+        template = '''
+TEMPLATE """[INST] <<SYS>>
+{{ .System }}
+<</SYS>>
+
+{{ .Prompt }} [/INST]"""
+'''
+        parameters.append('PARAMETER stop "[INST]"')
+        parameters.append('PARAMETER stop "[/INST]"')
+    else:
+        print(f"Warning: Could not determine a specific chat template for '{base_model_name}'.")
+        print("A generic Modelfile will be created. You may need to edit it manually.")
+
+    content = f"FROM ./{gguf_filename}\n"
+    if template: content += f"{template.strip()}\n"
+    if parameters: content += "\n".join(parameters) + "\n"
+
+    try:
+        with open(modelfile_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        
+        print(f"\n✅ Successfully created Modelfile at: {modelfile_path}")
+        print("\nTo create the model in Ollama, run the following command in your terminal:")
+        
+        suggested_model_name = os.path.splitext(gguf_filename)[0].replace("-", "_").lower()
+        print("="*70)
+        print(f"ollama create {suggested_model_name} -f {modelfile_path}")
+        print("="*70)
+
+    except Exception as e:
+        print(f"\nCould not create Modelfile: {e}")
+
 def main():
     parser = argparse.ArgumentParser(description="Fine-tune a model with LoRA and convert to GGUF.", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("base_model", type=str, help="Base model name or path.")
@@ -94,35 +139,22 @@ def main():
     trainer.train()
     print("Fine-tuning completed.")
     
-    # --- ▼▼▼ GGUF変換のためのモデル再ロードとマージ ▼▼▼
-    # ここからがQLoRAのベストプラクティスです
+    checkpoint_dirs = [d for d in os.listdir(output_dir) if d.startswith("checkpoint-")]
+    if not checkpoint_dirs: raise RuntimeError("No checkpoint found after training.")
+    latest_checkpoint = sorted(checkpoint_dirs, key=lambda d: int(d.split('-')[1]))[-1]
+    adapter_path = os.path.join(output_dir, latest_checkpoint)
     
-    # 1. トレーニングに使った4-bitモデルとトレーナーをメモリから解放
-    print("\nReleasing 4-bit model from memory...")
-    del model
-    del peft_model
-    del trainer
+    del model, peft_model, trainer
     torch.cuda.empty_cache()
 
-    # 2. ベースモデルを16-bit (FP16) の高精度で再ロード
-    print("Reloading base model in FP16 for clean merging...")
-    base_model_fp16 = AutoModelForCausalLM.from_pretrained(
-        args.base_model,
-        torch_dtype=torch.float16, # FP16でロード
-        device_map="auto",
-        trust_remote_code=True,
-    )
-
-    # 3. 保存されたLoRAアダプターを、この新しいFP16モデルに適用
-    # Trainerは自動的に`output_dir`にチェックポイントを保存します
-    adapter_path = os.path.join(output_dir, "checkpoint-1") # num_train_epochs=1なのでチェックポイントは1つ
+    print("\nReloading base model in FP16 for clean merging...")
+    base_model_fp16 = AutoModelForCausalLM.from_pretrained(args.base_model, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True)
+    
     print(f"Loading adapter from {adapter_path}...")
     merged_model = PeftModel.from_pretrained(base_model_fp16, adapter_path)
-
-    # 4. アダプターをベースモデルに完全にマージ
+    
     print("Merging adapter into FP16 model...")
     merged_model = merged_model.merge_and_unload()
-    # --- ▲▲▲ ここまでが新しいマージ処理 ▲▲▲
 
     print("\nStarting GGUF conversion process...")
     merged_model_dir = tempfile.mkdtemp()
@@ -139,7 +171,7 @@ def main():
         
         fp16_gguf_path = args.output_model + ".fp16.gguf"
         cmd_convert = [sys.executable, convert_script_path, merged_model_dir, "--outfile", fp16_gguf_path, "--outtype", "f16"]
-        print(f"\nStep 1: Running GGUF conversion (to FP16):\n{' '.join(cmd_convert)}\n")
+        print(f"\nStep 1: Running GGUF conversion (to FP16)...")
         subprocess.run(cmd_convert, check=True, text=True, stdout=sys.stdout, stderr=sys.stderr)
 
         if args.quantization == 16:
@@ -148,22 +180,25 @@ def main():
             quantize_executable_name = "llama-quantize"
             quantize_executable_path = os.path.join(llama_cpp_path, "build", "bin", quantize_executable_name)
             if not os.path.exists(quantize_executable_path):
-                raise FileNotFoundError(f"'{quantize_executable_name}' executable not found. Please build llama.cpp using CMake.")
+                raise FileNotFoundError(f"'{quantize_executable_name}' not found. Please build llama.cpp using CMake.")
             
             quant_map = {8: "Q8_0", 4: "Q4_K_M"}
             quant_type = quant_map[args.quantization]
             
             cmd_quantize = [quantize_executable_path, fp16_gguf_path, args.output_model, quant_type]
-            print(f"\nStep 2: Running GGUF quantization:\n{' '.join(cmd_quantize)}\n")
+            print(f"\nStep 2: Running GGUF quantization...")
             subprocess.run(cmd_quantize, check=True, text=True, stdout=sys.stdout, stderr=sys.stderr)
             os.remove(fp16_gguf_path)
         
         print(f"\n✅ Successfully created GGUF model at: {args.output_model}")
+        
+        # Modelfileの自動生成
+        create_modelfile(args.base_model, args.output_model)
 
     except Exception as e:
         print(f"\nAn error occurred during GGUF conversion: {e}")
     finally:
-        print("Cleaning up temporary directories...")
+        print("\nCleaning up temporary directories...")
         shutil.rmtree(output_dir)
         shutil.rmtree(merged_model_dir)
         
