@@ -68,6 +68,15 @@ TEMPLATE """[INST] <<SYS>>
 '''
         parameters.append('PARAMETER stop "[INST]"')
         parameters.append('PARAMETER stop "[/INST]"')
+    # CodeLlama-Instructモデル用のテンプレート
+    elif "codellama" in model_name_lower and "instruct" in model_name_lower:
+        print("Detected CodeLlama-Instruct style model. Generating appropriate Modelfile.")
+        template = '''
+TEMPLATE """[INST] {{ .System }} {{ .Prompt }} [/INST]"""
+'''
+        # CodeLlamaは stop token が不要なことが多い
+        parameters.append('PARAMETER stop "[INST]"')
+        parameters.append('PARAMETER stop "[/INST]"')
     else:
         print(f"Warning: Could not determine a specific chat template for '{base_model_name}'.")
         print("A generic Modelfile will be created. You may need to edit it manually.")
@@ -97,10 +106,11 @@ def main():
     parser.add_argument("base_model", type=str, help="Base model name or path.")
     parser.add_argument("dataset", type=str, nargs='?', default=None, help="Dataset JSON file path.")
     parser.add_argument("output_model", type=str, nargs='?', default=None, help="Final GGUF model file path.")
-    parser.add_argument("-q", "--quantization", type=int, choices=[4, 8, 16], default=8, help="Quantization bits.")
-    parser.add_argument("-r", "--rank", type=int, default=8, help="LoRA rank.")
-    parser.add_argument("--alpha", type=int, default=16, help="LoRA alpha.")
+    parser.add_argument("-q", "--quantization", type=int, choices=[4, 8, 16], default=4, help="Quantization bits.")
+    parser.add_argument("-r", "--rank", type=int, default=16, help="LoRA rank.")
+    parser.add_argument("--alpha", type=int, default=32, help="LoRA alpha.")
     parser.add_argument("--target-modules", type=str, default=None, help="Target modules for LoRA.")
+    parser.add_argument("-e", "--epoch", type=int, default=5, help="LoRA number of train epochs.")
     
     args = parser.parse_args()
     if args.dataset is None:
@@ -112,10 +122,11 @@ def main():
     bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16)
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
     
-    LLAMA2_CHAT_TEMPLATE = ("{% for message in messages %}{% if message['role'] == 'system' %}{{ '[INST] <<SYS>>\\n' + message['content'] + '\\n<</SYS>>\\n\\n' }}{% elif message['role'] == 'user' %}{{ message['content'] + ' [/INST]' }}{% elif message['role'] == 'assistant' %}{{ ' ' + message['content'] + ' ' + eos_token }}{% endif %}{% endfor %}")
-    if tokenizer.chat_template is None:
-        print("Applying a Llama-2-chat-style template.")
-        tokenizer.chat_template = LLAMA2_CHAT_TEMPLATE
+    # LLAMA2_CHAT_TEMPLATE = ("{% for message in messages %}{% if message['role'] == 'system' %}{{ '[INST] <<SYS>>\\n' + message['content'] + '\\n<</SYS>>\\n\\n' }}{% elif message['role'] == 'user' %}{{ message['content'] + ' [/INST]' }}{% elif message['role'] == 'assistant' %}{{ ' ' + message['content'] + ' ' + eos_token }}{% endif %}{% endfor %}")
+    # if tokenizer.chat_template is None:
+    #     print("Applying a Llama-2-chat-style template.")
+    #     tokenizer.chat_template = LLAMA2_CHAT_TEMPLATE
+
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     
     model = AutoModelForCausalLM.from_pretrained(args.base_model, quantization_config=bnb_config, device_map="auto", trust_remote_code=True)
@@ -133,7 +144,8 @@ def main():
     peft_model.print_trainable_parameters()
     
     output_dir = tempfile.mkdtemp()
-    training_args = TrainingArguments(output_dir=output_dir, per_device_train_batch_size=1, gradient_accumulation_steps=4, learning_rate=2e-4, num_train_epochs=1, logging_steps=10, fp16=True, save_strategy="epoch", report_to="none")
+    print(f"epoch = {args.epoch}")
+    training_args = TrainingArguments(output_dir=output_dir, per_device_train_batch_size=1, gradient_accumulation_steps=4, learning_rate=2e-4, num_train_epochs=args.epoch, logging_steps=10, fp16=True, save_strategy="epoch", report_to="none")
     trainer = Trainer(model=peft_model, args=training_args, train_dataset=tokenized_dataset, tokenizer=tokenizer, data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False))
     
     print("\nStarting fine-tuning process...")
