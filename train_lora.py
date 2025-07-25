@@ -23,29 +23,6 @@ from peft import (
 from datasets import load_dataset
 import bitsandbytes as bnb
 
-def find_targetable_modules(model_name: str):
-    print(f"Finding targetable modules for {model_name}...")
-    try:
-        bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16)
-        model = AutoModelForCausalLM.from_pretrained(model_name, quantization_config=bnb_config, device_map='auto', trust_remote_code=True)
-        lora_module_names = set()
-        for name, module in model.named_modules():
-            if isinstance(module, (bnb.nn.Linear4bit, bnb.nn.Linear8bitLt, torch.nn.Linear)):
-                module_name = name.split('.')[-1]
-                if module_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']:
-                    lora_module_names.add(module_name)
-        if not lora_module_names: print("Could not find any typical targetable modules.")
-        else:
-            print("\nFound potential target modules for LoRA:")
-            print("-----------------------------------------")
-            print(", ".join(sorted(list(lora_module_names))))
-            print("-----------------------------------------")
-            print(f'Use --target-modules, e.g., --target-modules "{",".join(sorted(list(lora_module_names))[:2])}"')
-    except Exception as e: print(f"An error occurred: {e}")
-    finally:
-        if 'model' in locals(): del model
-        torch.cuda.empty_cache()
-
 def create_modelfile(base_model_name: str, gguf_path: str):
     """
     指定されたGGUFファイル用のModelfileを自動生成する。
@@ -57,6 +34,7 @@ def create_modelfile(base_model_name: str, gguf_path: str):
     parameters = []
 
     model_name_lower = base_model_name.lower()
+    # モデル名に基づいてチャットテンプレートを自動設定
     if "llama-2" in model_name_lower and "instruct" in model_name_lower:
         print("Detected Llama-2-Instruct style model. Generating appropriate Modelfile.")
         template = '''
@@ -68,13 +46,11 @@ TEMPLATE """[INST] <<SYS>>
 '''
         parameters.append('PARAMETER stop "[INST]"')
         parameters.append('PARAMETER stop "[/INST]"')
-    # CodeLlama-Instructモデル用のテンプレート
     elif "codellama" in model_name_lower and "instruct" in model_name_lower:
         print("Detected CodeLlama-Instruct style model. Generating appropriate Modelfile.")
         template = '''
 TEMPLATE """[INST] {{ .System }} {{ .Prompt }} [/INST]"""
 '''
-        # CodeLlamaは stop token が不要なことが多い
         parameters.append('PARAMETER stop "[INST]"')
         parameters.append('PARAMETER stop "[/INST]"')
     else:
@@ -92,7 +68,6 @@ TEMPLATE """[INST] {{ .System }} {{ .Prompt }} [/INST]"""
         print(f"\n✅ Successfully created Modelfile at: {modelfile_path}")
         print("\nTo create the model in Ollama, run the following command in your terminal:")
         
-        # suggested_model_name = os.path.splitext(gguf_filename)[0].replace("-", "_").lower()
         suggested_model_name = os.path.splitext(gguf_filename)[0]
         print("="*70)
         print(f"ollama create {suggested_model_name} -f {modelfile_path}")
@@ -103,36 +78,32 @@ TEMPLATE """[INST] {{ .System }} {{ .Prompt }} [/INST]"""
 
 def main():
     parser = argparse.ArgumentParser(description="Fine-tune a model with LoRA and convert to GGUF.", formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument("base_model", type=str, help="Base model name or path.")
-    parser.add_argument("dataset", type=str, nargs='?', default=None, help="Dataset JSON file path.")
-    parser.add_argument("output_model", type=str, nargs='?', default=None, help="Final GGUF model file path.")
-    parser.add_argument("-q", "--quantization", type=int, choices=[4, 8, 16], default=4, help="Quantization bits.")
-    parser.add_argument("-r", "--rank", type=int, default=16, help="LoRA rank.")
-    parser.add_argument("--alpha", type=int, default=32, help="LoRA alpha.")
-    parser.add_argument("--target-modules", type=str, default=None, help="Target modules for LoRA.")
-    parser.add_argument("-e", "--epoch", type=int, default=5, help="LoRA number of train epochs.")
+    
+    # 必須引数を明確化
+    parser.add_argument("base_model", type=str, help="Base model name or path (e.g., 'meta-llama/Llama-2-7b-chat-hf').")
+    parser.add_argument("dataset", type=str, help="Dataset JSON file path.")
+    parser.add_argument("output_model", type=str, help="Final GGUF model file path (e.g., './my-model.gguf').")
+    
+    # オプション引数
+    parser.add_argument("--target-modules", type=str, required=True, help="Comma-separated list of target modules for LoRA (e.g., 'q_proj,v_proj'). Use find_modules.py to discover these.")
+    parser.add_argument("-q", "--quantization", type=int, choices=[4, 8, 16], default=4, help="Quantization bits for the final GGUF file. Default: 4.")
+    parser.add_argument("-r", "--rank", type=int, default=16, help="LoRA rank. Default: 16.")
+    parser.add_argument("--alpha", type=int, default=32, help="LoRA alpha. Default: 32.")
+    parser.add_argument("-e", "--epoch", type=int, default=5, help="Number of training epochs. Default: 5.")
     
     args = parser.parse_args()
-    if args.dataset is None:
-        find_targetable_modules(args.base_model)
-        sys.exit(0)
-    if args.output_model is None: parser.error("output_model is required.")
-    if args.target_modules is None: parser.error("--target-modules is required.")
     
     bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16)
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
     
-    # LLAMA2_CHAT_TEMPLATE = ("{% for message in messages %}{% if message['role'] == 'system' %}{{ '[INST] <<SYS>>\\n' + message['content'] + '\\n<</SYS>>\\n\\n' }}{% elif message['role'] == 'user' %}{{ message['content'] + ' [/INST]' }}{% elif message['role'] == 'assistant' %}{{ ' ' + message['content'] + ' ' + eos_token }}{% endif %}{% endfor %}")
-    # if tokenizer.chat_template is None:
-    #     print("Applying a Llama-2-chat-style template.")
-    #     tokenizer.chat_template = LLAMA2_CHAT_TEMPLATE
-
-    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     
     model = AutoModelForCausalLM.from_pretrained(args.base_model, quantization_config=bnb_config, device_map="auto", trust_remote_code=True)
     model.config.use_cache = False
     
     def preprocess_function(example):
+        # Hugging Faceの標準的なチャットテンプレート形式を適用
         text = tokenizer.apply_chat_template(example["messages"], tokenize=False, add_generation_prompt=False)
         return tokenizer(text, truncation=True, max_length=2048, padding=False)
     
@@ -144,14 +115,25 @@ def main():
     peft_model.print_trainable_parameters()
     
     output_dir = tempfile.mkdtemp()
-    print(f"epoch = {args.epoch}")
-    training_args = TrainingArguments(output_dir=output_dir, per_device_train_batch_size=1, gradient_accumulation_steps=4, learning_rate=2e-4, num_train_epochs=args.epoch, logging_steps=10, fp16=True, save_strategy="epoch", report_to="none")
+    
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=4,
+        learning_rate=2e-4,
+        num_train_epochs=args.epoch,
+        logging_steps=10,
+        fp16=True,
+        save_strategy="epoch",
+        report_to="none"
+    )
     trainer = Trainer(model=peft_model, args=training_args, train_dataset=tokenized_dataset, tokenizer=tokenizer, data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False))
     
     print("\nStarting fine-tuning process...")
     trainer.train()
     print("Fine-tuning completed.")
     
+    # 最新のチェックポイントからアダプタをロード
     checkpoint_dirs = [d for d in os.listdir(output_dir) if d.startswith("checkpoint-")]
     if not checkpoint_dirs: raise RuntimeError("No checkpoint found after training.")
     latest_checkpoint = sorted(checkpoint_dirs, key=lambda d: int(d.split('-')[1]))[-1]
@@ -177,10 +159,12 @@ def main():
         tokenizer.save_pretrained(merged_model_dir)
         
         llama_cpp_path = os.environ.get("LLAMA_CPP_PATH")
-        if not llama_cpp_path: raise ValueError("LLAMA_CPP_PATH environment variable not set.")
+        if not llama_cpp_path:
+            raise ValueError("LLAMA_CPP_PATH environment variable not set. Please set it to the root of your llama.cpp repository.")
 
         convert_script_path = os.path.join(llama_cpp_path, "convert_hf_to_gguf.py")
-        if not os.path.exists(convert_script_path): raise FileNotFoundError(f"'convert_hf_to_gguf.py' not found in {llama_cpp_path}")
+        if not os.path.exists(convert_script_path):
+            raise FileNotFoundError(f"'convert_hf_to_gguf.py' not found in {llama_cpp_path}")
         
         fp16_gguf_path = args.output_model + ".fp16.gguf"
         cmd_convert = [sys.executable, convert_script_path, merged_model_dir, "--outfile", fp16_gguf_path, "--outtype", "f16"]
@@ -191,21 +175,23 @@ def main():
             shutil.move(fp16_gguf_path, args.output_model)
         else:
             quantize_executable_name = "llama-quantize"
+            # llama.cppのビルドディレクトリを想定
             quantize_executable_path = os.path.join(llama_cpp_path, "build", "bin", quantize_executable_name)
             if not os.path.exists(quantize_executable_path):
-                raise FileNotFoundError(f"'{quantize_executable_name}' not found. Please build llama.cpp using CMake.")
+                 quantize_executable_path = os.path.join(llama_cpp_path, quantize_executable_name) # ルートにある場合も考慮
+            if not os.path.exists(quantize_executable_path):
+                raise FileNotFoundError(f"'{quantize_executable_name}' not found. Please build llama.cpp (e.g., by running 'make').")
             
             quant_map = {8: "Q8_0", 4: "Q4_K_M"}
             quant_type = quant_map[args.quantization]
             
             cmd_quantize = [quantize_executable_path, fp16_gguf_path, args.output_model, quant_type]
-            print(f"\nStep 2: Running GGUF quantization...")
+            print(f"\nStep 2: Running GGUF quantization (to {quant_type})...")
             subprocess.run(cmd_quantize, check=True, text=True, stdout=sys.stdout, stderr=sys.stderr)
             os.remove(fp16_gguf_path)
         
         print(f"\n✅ Successfully created GGUF model at: {args.output_model}")
         
-        # Modelfileの自動生成
         create_modelfile(args.base_model, args.output_model)
 
     except Exception as e:
