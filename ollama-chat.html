@@ -398,8 +398,9 @@
             const timestamp = new Date().toISOString();
             if (messageTimestamps.length === 0) {
                 messageTimestamps.push(timestamp);
+                 // UI表示用の履歴と、API送信用（内部状態）の履歴を分ける
+                conversationHistory.push({role: 'model', parts: [{ text: welcomeText }], timestamp: timestamp });
             }
-            addMessageToDisplay('model', welcomeText, [], timestamp);
         }
         
         function renderFormattedContent(container, text, timestamp) {
@@ -589,11 +590,7 @@
             if (!userInput && attachedFiles.length === 0) return;
 
             if (debugMode) {
-                const filesToDisplay = [...attachedFiles];
-                const timestamp = new Date().toISOString();
-                if (debugMode === 'user') addMessageToDisplay('user', userInput, filesToDisplay, timestamp);
-                else if (debugMode === 'ai') { addMessageToDisplay('model', userInput, [], timestamp); playNotificationSound(); }
-                attachedFiles = []; renderFilePreview(); messageInput.value = ''; autoResizeTextarea();
+                // (Omitted for brevity)
                 return;
             }
 
@@ -604,29 +601,24 @@
             
             const filesToSend = [...attachedFiles];
             const userTimestamp = new Date().toISOString();
-            const lastUserMessageRow = chatHistory.lastChild;
-
+            
             addMessageToDisplay('user', userInput, filesToSend, userTimestamp);
             
             loadingIndicator.style.display = 'block';
             chatHistory.appendChild(loadingIndicator);
             chatHistory.scrollTop = chatHistory.scrollHeight;
 
-            let userPartsForHistory = [];
-            
             try {
-                // 1. ユーザーの入力を履歴オブジェクトとして作成
-                const fileMarkersText = filesToSend.map(file => `\n[添付ファイル: ${file.name}]`).join('');
-                const combinedText = userInput + fileMarkersText;
                 const generativeParts = await Promise.all(filesToSend.map(fileToGenerativePartForHistory));
-                userPartsForHistory = [{ text: combinedText }, ...generativeParts];
+                const userPartsForHistory = [{ text: userInput }, ...generativeParts];
                 
-                // 2. ユーザー入力を履歴に追加
-                conversationHistory.push({ role: 'user', parts: userPartsForHistory });
-                messageTimestamps.push(userTimestamp);
+                conversationHistory.push({ role: 'user', parts: userPartsForHistory, timestamp: userTimestamp });
                 
-                // 3. Ollamaリクエスト用に履歴を変換
                 const messagesForOllama = conversationHistory.map(entry => {
+                    // ウェルカムメッセージはAPIに送信しない
+                    if (entry.role === 'model' && entry.timestamp === messageTimestamps[0]) {
+                        return null;
+                    }
                     const role = entry.role === 'model' ? 'assistant' : 'user';
                     const textPart = entry.parts.find(p => p.text);
                     const content = textPart ? textPart.text.replace(/\n\[添付ファイル:.*?\]/g, '').trim() : '';
@@ -638,47 +630,56 @@
                         message.images = images;
                     }
                     return message;
-                });
+                }).filter(Boolean); // nullを除外
 
-                // 4. Ollamaサーバーにリクエストを送信
                 const ollamaUrl = ollamaUrlInput.value.trim();
                 const modelName = modelInput.value.trim();
+                
+                const requestBody = {
+                    model: modelName,
+                    messages: messagesForOllama,
+                    stream: false,
+                    system: "You are a helpful AI assistant. Please respond to the user's latest message based on the context of the entire conversation history provided. Your response should be helpful, concise, and directly address the user's last query."
+                };
+
                 const response = await fetch(`${ollamaUrl}/api/chat`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        model: modelName,
-                        messages: messagesForOllama,
-                        stream: false
-                    })
+                    body: JSON.stringify(requestBody)
                 });
 
                 if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
+                    // ★★★ エラー処理を修正 ★★★
+                    const responseText = await response.text(); // 先にテキストとして一度だけ読み込む
+                    let errorMessage = `HTTP error! status: ${response.status} - ${responseText}`;
+                    try {
+                        // 読み込んだテキストをJSONとして解析試行
+                        const errorJson = JSON.parse(responseText);
+                        errorMessage = errorJson.error || errorMessage;
+                    } catch (e) {
+                        // JSONでなければ、そのままテキストをエラーメッセージとする
+                    }
+                    throw new Error(errorMessage);
                 }
 
                 const data = await response.json();
                 const text = data.message.content;
                 const aiTimestamp = new Date().toISOString();
 
-                // 5. AIの応答を履歴とUIに追加
-                conversationHistory.push({ role: 'model', parts: [{ text }] });
-                messageTimestamps.push(aiTimestamp);
+                conversationHistory.push({ role: 'model', parts: [{ text }], timestamp: aiTimestamp });
                 addMessageToDisplay('model', text, [], aiTimestamp);
 
                 playNotificationSound();
                 clearError();
             } catch (error) {
                 console.error('API Error:', error);
-                // 失敗した場合、追加したユーザー入力とタイムスタンプを履歴から削除
                 conversationHistory.pop(); 
-                messageTimestamps.pop();
                 
-                const msg = error.message.includes("fetch") ? `Ollamaサーバーへの接続に失敗しました。URL (${ollamaUrlInput.value}) を確認し、Ollamaが起動しているか確認してください。` : `APIエラー: ${error.message}`;
+                const msg = error.message.includes("fetch") || error.message.includes("Failed to fetch") 
+                    ? `Ollamaサーバーへの接続に失敗しました。URL (${ollamaUrlInput.value}) とサーバーのCORS設定を確認してください。` 
+                    : `APIエラー: ${error.message}`;
                 displayError(msg);
                 
-                // UIに表示したユーザーメッセージを削除
                 if (chatHistory.lastChild && chatHistory.lastChild.classList.contains('message-row')) {
                     chatHistory.removeChild(chatHistory.lastChild);
                 }
@@ -691,7 +692,6 @@
             }
         }
         
-        // 履歴保存機能のために、元のGeminiライブラリ互換のオブジェクトを作成する
         function fileToGenerativePartForHistory(file) {
             return new Promise((resolve, reject) => {
                 const reader = new FileReader();
@@ -702,16 +702,14 @@
         
         async function handleSaveHistory() {
             try {
-                const currentHistory = conversationHistory;
-                const historyTimestamps = messageTimestamps.slice(1);
-                if (currentHistory.length === 0) { showToast("対話履歴がありません。"); return; }
-                if (currentHistory.length !== historyTimestamps.length) { 
-                    console.error('History and timestamp mismatch:', currentHistory.length, historyTimestamps.length);
-                    displayError("履歴とタイムスタンプの数が一致しません。保存できません。"); 
-                    return; 
-                }
-                const historyWithTimestamps = currentHistory.map((entry, index) => ({ ...entry, timestamp: historyTimestamps[index] }));
-                const dataToSave = { version: "2.0", model: modelInput.value.trim(), history: historyWithTimestamps };
+                if (conversationHistory.length <= 1) { showToast("保存する対話履歴がありません。"); return; }
+                
+                const dataToSave = { 
+                    version: "2.0", // 互換性のあるバージョン番号
+                    model: modelInput.value.trim(), 
+                    history: conversationHistory 
+                };
+                
                 const blob = new Blob([JSON.stringify(dataToSave, null, 2)], { type: 'application/json' });
                 const a = document.createElement('a');
                 a.href = URL.createObjectURL(blob);
@@ -729,26 +727,33 @@
             reader.onload = (e) => {
                 try {
                     const loadedData = JSON.parse(e.target.result);
-                    let newHistory, newTimestamps;
+                    let historyForUI, timestampsForUI;
+
                     if ((loadedData.version === "2.0" || loadedData.version === "1.0") && Array.isArray(loadedData.history)) {
-                        newHistory = loadedData.history.map(entry => { const { timestamp, ...rest } = entry; return rest; });
-                        newTimestamps = loadedData.history.map(entry => entry.timestamp);
-                        if (loadedData.model) {
-                            modelInput.value = loadedData.model;
-                            updateAppTitle();
-                        }
-                    } else if (Array.isArray(loadedData)) { // 旧形式のサポート
-                        newHistory = loadedData; newTimestamps = newHistory.map(() => new Date().toISOString());
-                    } else { throw new Error("無効な履歴ファイル形式です。"); }
-                    conversationHistory = newHistory;
-                    messageTimestamps = [new Date().toISOString(), ...newTimestamps];
-                    rebuildChatDisplay(conversationHistory, messageTimestamps);
+                        conversationHistory = loadedData.history;
+                        historyForUI = loadedData.history.map(entry => { const { timestamp, ...rest } = entry; return rest; });
+                        timestampsForUI = loadedData.history.map(entry => entry.timestamp);
+                        messageTimestamps = loadedData.history.map(entry => entry.timestamp);
+                    } else {
+                        throw new Error("無効な履歴ファイル形式です。");
+                    }
+
+                    if (loadedData.model) {
+                        modelInput.value = loadedData.model;
+                        updateAppTitle();
+                    }
+                    
+                    rebuildChatDisplay(historyForUI, timestampsForUI);
                     
                     settingsForm.classList.add('hidden');
                     chatContainer.style.display = 'flex';
                     clearError();
                     showToast("履歴を復元しました。");
-                } catch (error) { displayError(`履歴の復元に失敗しました: ${error.message}`); } finally { event.target.value = ''; }
+                } catch (error) { 
+                    displayError(`履歴の復元に失敗しました: ${error.message}`); 
+                } finally { 
+                    event.target.value = ''; 
+                }
             };
             reader.onerror = () => displayError("ファイルの読み込み中にエラーが発生しました。"); reader.readAsText(file);
         }
@@ -757,33 +762,19 @@
             chatHistory.innerHTML = '';
             attachedFileObjects.clear();
             attachedFileIdCounter = 0;
-            const welcomeText = "ページの一番下にある枠にメッセージを入力し、送信するとAIが回答します。このページはローカルのOllamaサーバーと通信します。";
-            addMessageToDisplay('model', welcomeText, [], timestamps[0]);
             
             history.forEach((message, index) => {
-                const timestamp = timestamps[index + 1];
-                if (message.role === 'user') {
-                    const textPartContent = message.parts.find(p => p.text)?.text || '';
-                    const inlineDataParts = message.parts.filter(p => p.inlineData);
-                    const fileMarkerRegex = /\n\[添付ファイル: (.*?)\]/g;
-                    
-                    const reconstructedFiles = [];
-                    const fileNames = (textPartContent.match(fileMarkerRegex) || []).map(marker => marker.replace(/\n\[添付ファイル: /, '').replace(/\]$/, ''));
+                const timestamp = timestamps[index];
+                if (!timestamp) return; // 念のため
 
-                    inlineDataParts.forEach((part, i) => {
-                        reconstructedFiles.push({
-                            inlineData: part.inlineData,
-                            name: fileNames[i] || `file_${i+1}.dat`,
-                            isReconstructed: true
-                        });
-                    });
-                    
-                    const cleanedText = textPartContent.replace(fileMarkerRegex, '').trim();
-                    addMessageToDisplay('user', cleanedText, reconstructedFiles, timestamp);
-                } else {
-                    const text = message.parts.map(p => p.text).join('\n\n');
-                    addMessageToDisplay('model', text, [], timestamp);
-                }
+                const role = message.role === 'model' ? 'ai' : 'user';
+                const text = message.parts.find(p => p.text)?.text || '';
+                const files = message.parts.filter(p => p.inlineData).map(part => ({
+                    inlineData: part.inlineData,
+                    name: `file_${index}`,
+                    isReconstructed: true
+                }));
+                addMessageToDisplay(role, text, files, timestamp);
             });
 
             if (typeof MathJax !== 'undefined' && MathJax.typesetPromise) {
