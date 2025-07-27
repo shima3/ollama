@@ -5,7 +5,7 @@ services:
     image: ollama/ollama:latest
     container_name: ollama
     ports:
-      - "11434:11434"  # 外部接続用（必要なら制限可）
+      - "14434:11434"  # 外部接続用（必要なら制限可）
     volumes:
       - ollama-data:/root/.ollama
     restart: unless-stopped
@@ -16,7 +16,7 @@ services:
     ports:
       - "3000:8080"  # Webブラウザでアクセスするポート
     environment:
-      - OLLAMA_API_BASE_URL=http://ollama:11434
+      - OLLAMA_API_BASE_URL=http://ollama:14434
     depends_on:
       - ollama
     volumes:
