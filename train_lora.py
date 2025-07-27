@@ -79,7 +79,7 @@ def main():
     bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16)
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
 
-    # ELYZA/CodeLlama用のチャットテンプレートが設定されていないため、手動で設定
+    # チャットテンプレートが設定されていなければ、強制的に設定する。
     if tokenizer.chat_template is None:
         print("Tokenizer `chat_template` is not set. Applying ELYZA/Codellama template manually.")
         chat_template = (
